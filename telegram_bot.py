@@ -25,6 +25,7 @@ from telegram.ext import (
 
 # Add parent directory to path
 from database import Database
+from supabase_database import SupabaseDatabase
 from admin_handlers import (
     admin_command, admin_stats, admin_users, admin_broadcast_menu,
     admin_logs, admin_search_history, admin_db_info, broadcast_command,
@@ -104,9 +105,14 @@ API_BASE_URL = os.getenv('MOC_API_URL', 'https://bizsearch.up.railway.app')
 API_KEY = os.getenv('MOC_API_KEY', 'moc_HNhgXE4sZSXO7iBeUYOyICD4yz0ASncwDsBh5yV9g0M')
 
 # Initialize database (use /app/data in Docker, current dir otherwise)
-db_path = '/app/data/mocbot.db' if os.path.exists('/app/data') else 'mocbot.db'
-db = Database(db_path)
-logger.info(f"Database initialized at: {db_path}")
+use_supabase = os.getenv('USE_SUPABASE', 'false').lower() == 'true'
+if use_supabase:
+    logger.info("Using Supabase PostgreSQL database")
+    db = SupabaseDatabase()
+else:
+    db_path = '/app/data/mocbot.db' if os.path.exists('/app/data') else 'mocbot.db'
+    db = Database(db_path)
+    logger.info(f"SQLite database initialized at: {db_path}")
 
 # Initialize admin users from environment variable
 admin_ids_str = os.getenv('ADMIN_IDS', '')
@@ -150,14 +156,15 @@ def get_main_menu_keyboard():
     keyboard = [
         [
             InlineKeyboardButton("🔍 Search Company", callback_data="menu_search"),
-            InlineKeyboardButton("📊 Export CSV", callback_data="menu_export")
+            InlineKeyboardButton("👤 Search Director", callback_data="menu_search_director"),
         ],
         [
+            InlineKeyboardButton("📊 Export CSV", callback_data="menu_export"),
             InlineKeyboardButton("📜 Search History", callback_data="menu_history"),
-            InlineKeyboardButton("ℹ️ Help", callback_data="menu_help")
         ],
         [
-            InlineKeyboardButton("📖 About", callback_data="menu_about")
+            InlineKeyboardButton("ℹ️ Help", callback_data="menu_help"),
+            InlineKeyboardButton("📖 About", callback_data="menu_about"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -210,10 +217,12 @@ Welcome! I can help you search for business entities registered with the Cambodi
 
 *Quick Actions:*
 • Click buttons below to navigate
-• Or type a company name to search directly
+• Type a company name to search directly
+• Use 👤 Search Director for person search
 
 *Available Commands:*
 /search - Search for a company
+/sd - Search for a director
 /export - Export last search to CSV
 /history - View search history
 /help - Show help information
@@ -234,50 +243,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📖 *Help - How to Use This Bot*
 
 *Search Methods:*
-1️⃣ Direct message: Just type the company name
-   Example: `ACLEDA`
+1️⃣ Company search: Type company name or use /search
+   Example: `ACLEDA` or `/search AEON`
 
-2️⃣ Using command: `/search Company Name`
-   Example: `/search AEON`
+2️⃣ Director search: Click "👤 Search Director" or use /sd
+   Example: Type a person name after clicking the button
 
-3️⃣ Using menu: Click "🔍 Search Company" button
+3️⃣ Using menu: Click buttons below to navigate
 
-*What You'll Get:*
+*Company Search Results:*
 • Company name (English & Khmer)
 • Registration number
-• Original entity identifier
-• Company status
-• Incorporation & re-registration dates
-• Entity type
-• Tax Identification Number (TIN)
-• Tax registration date
-• Annual return filing date
+• Status, Entity Type, TIN
+• Incorporation/Re-registration dates
 • Full address
 • Click "📄 Get Full Details" to see directors
 
+*Director Search Results:*
+• Find all companies associated with a person
+• View position/role in each company
+• Registration numbers for each company
+
 *Detailed Information:*
-• Click the "📄 Get Full Details" button on any result
-• View complete company information including:
-  - All directors with positions
-  - Nationality of directors
-  - Appointment dates
-  - And more...
+• Click "📄 Get Full Details" on any company result
+• View complete directors list with:
+  - Positions, Nationality, Appointment dates
+  - Chairman status, Former directors
 
 *Export to CSV:*
 • Use `/export` command after a search
 • Or click "📊 Export CSV" in menu
-• Receive CSV file with all results
 
 *Search History:*
-• View your recent searches with `/history`
+• View recent searches with `/history`
 • Or click "📜 Search History" in menu
 
 *Tips:*
 ✓ Use partial names for broader results
 ✓ Search is case-insensitive
-✓ Results typically take 15-20 seconds
-✓ You can export results to CSV format
 ✓ Get detailed director info with one click
+✓ Director search returns all companies for a person
 
 Need more help? Use the menu buttons below! 👇
 """
@@ -358,6 +363,22 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Please provide a company name to search.\n\n"
             "*Usage:* `/search Company Name`\n"
             "*Example:* `/search C.NO Construction`",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+    
+    
+async def search_director_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sd command - search for a director."""
+    if context.args:
+        search_term = ' '.join(context.args)
+        await perform_director_search(update, context, search_term)
+    else:
+        await update.message.reply_text(
+            "👤 *Search Director*\n\n"
+            "Please type the person/director name you want to search for.\n\n"
+            "*Usage:* `/sd Person Name`\n"
+            "*Example:* `/sd John Doe`",
             parse_mode='Markdown',
             reply_markup=get_main_menu_keyboard()
         )
@@ -751,6 +772,117 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, sea
             logger.info(f"🏁 User {username} ({user_id}) search completed | Active searches: {concurrent_searches}/{MAX_CONCURRENT_SEARCHES}")
 
 
+async def perform_director_search(update: Update, context: ContextTypes.DEFAULT_TYPE, search_term: str):
+    """Perform director search via API."""
+    global concurrent_searches
+    
+    user_id = update.effective_user.id
+    username = update.effective_user.username or f"User_{user_id}"
+    
+    if user_id in active_searches:
+        msg = "❌ You already have an active search. Please wait or cancel it first."
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        else:
+            await update.message.reply_text(msg, reply_markup=get_main_menu_keyboard())
+        return
+    
+    if concurrent_searches >= MAX_CONCURRENT_SEARCHES:
+        await update.message.reply_text(f"🚦 *System Busy*\n\nPlease try again later.", parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+        return
+    
+    db.update_user_activity(user_id)
+    if db.is_blocked(user_id):
+        await update.message.reply_text("❌ You have been blocked from using this bot.")
+        return
+    
+    db.log_interaction(user_id, 'search_director', message_text=search_term)
+    
+    cancel_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel Search", callback_data=f"cancel_search_{user_id}")]
+    ])
+    
+    if update.callback_query:
+        status_message = await update.callback_query.message.reply_text(
+            f"👤 Searching for director: *{search_term}*\n\nPlease wait...",
+            parse_mode='Markdown', reply_markup=cancel_keyboard
+        )
+    else:
+        status_message = await update.message.reply_text(
+            f"👤 Searching for director: *{search_term}*\n\nPlease wait...",
+            parse_mode='Markdown', reply_markup=cancel_keyboard
+        )
+    
+    concurrent_searches += 1
+    active_searches[user_id] = {'search_term': search_term, 'status_message': status_message, 'cancelled': False, 'username': username, 'start_time': datetime.now()}
+    
+    try:
+        loop = asyncio.get_event_loop()
+        start_time = __import__('time').time()
+        
+        def run_director_search():
+            if user_id in active_searches and active_searches[user_id]['cancelled']:
+                return None
+            try:
+                with httpx.Client(timeout=60) as client:
+                    resp = client.post(
+                        f"{API_BASE_URL}/api/v1/search/director",
+                        json={"director_name": search_term, "use_cache": True},
+                        headers={"X-API-Key": API_KEY},
+                    )
+                    data = resp.json()
+                    if data.get("success"):
+                        return data.get("results", [])
+                    return []
+            except Exception as e:
+                logger.error(f"API director search error: {e}", exc_info=True)
+                return []
+        
+        results = await asyncio.wait_for(loop.run_in_executor(executor, run_director_search), timeout=75.0)
+        search_duration = __import__('time').time() - start_time
+        
+        if not results:
+            await status_message.edit_text(
+                f"❌ No directors found for: *{search_term}*",
+                parse_mode='Markdown', reply_markup=get_main_menu_keyboard()
+            )
+            return
+        
+        await status_message.edit_text(
+            f"✅ Found *{len(results)}* director result(s) for: *{search_term}*",
+            parse_mode='Markdown'
+        )
+        
+        for i, person in enumerate(results, 1):
+            person_name = person.get('person_name', 'Unknown')
+            companies = person.get('companies', [])
+            
+            msg = f"*👤 Director Result {i}/{len(results)}*\n\n"
+            msg += f"*Name:* {person_name}\n"
+            msg += f"*Companies ({len(companies)}):*\n"
+            
+            for j, comp in enumerate(companies[:10], 1):
+                msg += f"  {j}. *{comp.get('company_name', 'N/A')}*\n"
+                msg += f"     Reg#: `{comp.get('registration_number', 'N/A')}`\n"
+                msg += f"     Role: {comp.get('position', 'N/A')}\n"
+            
+            if len(companies) > 10:
+                msg += f"     ... and {len(companies) - 10} more\n"
+            
+            kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_main")]]
+            await status_message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    
+    except Exception as e:
+        logger.error(f"Director search error: {e}", exc_info=True)
+        await status_message.edit_text(f"❌ Error: {str(e)[:100]}", reply_markup=get_main_menu_keyboard())
+    
+    finally:
+        if user_id in active_searches:
+            concurrent_searches = max(0, concurrent_searches - 1)
+            del active_searches[user_id]
+            logger.info(f"🏁 Director search for {username} completed")
+
+
 async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Cancel an active search for a user."""
     global concurrent_searches
@@ -785,7 +917,13 @@ async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages as search queries."""
     search_term = update.message.text.strip()
-    await perform_search(update, context, search_term)
+    
+    # Check if user is in director search mode
+    if context.user_data.get('search_mode') == 'director':
+        context.user_data['search_mode'] = 'company'  # Reset after use
+        await perform_director_search(update, context, search_term)
+    else:
+        await perform_search(update, context, search_term)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -849,7 +987,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Invalid cancel request", show_alert=True)
     
     elif callback_data == "menu_search":
-        # Prompt for search
+        # Reset mode to company and prompt
+        context.user_data['search_mode'] = 'company'
         await query.edit_message_text(
             "🔍 *Search Company*\n\n"
             "Please type the company name you want to search for.\n\n"
@@ -857,6 +996,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ACLEDA\n"
             "• AEON\n"
             "• ABA\n\n"
+            "Just type the name and send!",
+            parse_mode='Markdown',
+            reply_markup=get_back_keyboard()
+        )
+    
+    elif callback_data == "menu_search_director":
+        # Set director search mode and prompt
+        context.user_data['search_mode'] = 'director'
+        await query.edit_message_text(
+            "👤 *Search Director*\n\n"
+            "Please type the director or person name you want to search for.\n\n"
+            "*Examples:*\n"
+            "• John Doe\n"
+            "• Michael Chen\n"
+            "• សុផា មាន\n\n"
             "Just type the name and send!",
             parse_mode='Markdown',
             reply_markup=get_back_keyboard()
@@ -986,15 +1140,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     with httpx.Client(timeout=60) as client:
                         resp = client.post(
-                            f"{API_BASE_URL}/api/v1/search/company",
-                            json={"company_name": result.entity_name, "include_directors": True, "use_cache": True},
+                            f"{API_BASE_URL}/api/v1/company/details",
+                            json={
+                                "registration_number": result.registration_number,
+                                "entity_name": result.entity_name,
+                                "original_id": result.original_id,
+                                "fetch_if_missing": True
+                            },
                             headers={"X-API-Key": API_KEY},
                         )
-                    data = resp.json()
-                    if data.get("success") and data.get("results"):
-                        detailed = data["results"][0]
-                        return SearchResult(detailed)
-                    return result
+                        data = resp.json()
+                        if data.get("success"):
+                            return SearchResult({
+                                "entity_name": data.get("entity_name", result.entity_name),
+                                "entity_name_khmer": data.get("entity_name_khmer", ""),
+                                "registration_number": data.get("registration_number", result.registration_number),
+                                "original_id": data.get("original_id", ""),
+                                "status": data.get("status", ""),
+                                "registration_date": data.get("registration_date", ""),
+                                "re_registration_date": data.get("re_registration_date", ""),
+                                "entity_type": data.get("entity_type", ""),
+                                "tin": data.get("tin", ""),
+                                "tax_registration_date": data.get("tax_registration_date", ""),
+                                "annual_return_date": data.get("annual_return_date", ""),
+                                "address": data.get("address", ""),
+                                "directors": data.get("directors", [])
+                            })
+                        return result
                 except Exception as e:
                     logger.error(f"API details error: {e}", exc_info=True)
                     return result
@@ -1120,6 +1292,7 @@ async def post_init(application: Application):
     commands = [
         BotCommand("start", "🏠 Start the bot and show main menu"),
         BotCommand("search", "🔍 Search for a company"),
+        BotCommand("sd", "👤 Search for a director"),
         BotCommand("export", "📥 Export last search to CSV"),
         BotCommand("history", "📜 View your search history"),
         BotCommand("help", "❓ Show help information"),
@@ -1204,6 +1377,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("sd", search_director_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("export", export_command))
     
