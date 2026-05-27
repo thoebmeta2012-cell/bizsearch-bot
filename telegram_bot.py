@@ -441,6 +441,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_search = history[-1]
     results = last_search.get('results', [])
     search_term = last_search['search_term']
+    search_type = last_search.get('search_type', 'company')
     
     if not results:
         await update.message.reply_text(
@@ -453,17 +454,30 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Write headers
-    writer.writerow(SearchResult.csv_headers())
-    
-    # Write data
-    for result in results:
-        writer.writerow(result.to_csv_row())
+    if search_type == 'director':
+        # Director CSV: one row per company affiliation
+        writer.writerow(["Director Name", "Company Name", "Registration Number", "Position"])
+        for person in results:
+            person_name = person.get('person_name', 'Unknown')
+            for comp in person.get('companies', []):
+                writer.writerow([
+                    person_name,
+                    comp.get('company_name', ''),
+                    comp.get('registration_number', ''),
+                    comp.get('position', ''),
+                ])
+        csv_file_name = f"director_search_{search_term.replace(' ', '_')}.csv"
+    else:
+        # Company CSV
+        writer.writerow(SearchResult.csv_headers())
+        for result in results:
+            writer.writerow(result.to_csv_row())
+        csv_file_name = f"moc_search_{search_term.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     # Convert to bytes
     csv_bytes = output.getvalue().encode('utf-8-sig')
     csv_file = io.BytesIO(csv_bytes)
-    csv_file.name = f"moc_search_{search_term.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    csv_file.name = csv_file_name
     
     # Send file
     caption = f"📊 *CSV Export*\n\nSearch: `{search_term}`\nResults: {len(results)}\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -853,24 +867,41 @@ async def perform_director_search(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='Markdown'
         )
         
+        # Store director results for export
+        if user_id not in user_search_history:
+            user_search_history[user_id] = []
+        user_search_history[user_id].append({
+            'search_term': search_term,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'results_count': len(results),
+            'results': results,
+            'search_type': 'director'  # Mark as director search for export
+        })
+        if len(user_search_history[user_id]) > 20:
+            user_search_history[user_id] = user_search_history[user_id][-20:]
+        
         for i, person in enumerate(results, 1):
             person_name = person.get('person_name', 'Unknown')
             companies = person.get('companies', [])
             
-            msg = f"*👤 Director Result {i}/{len(results)}*\n\n"
-            msg += f"*Name:* {person_name}\n"
-            msg += f"*Companies ({len(companies)}):*\n"
+            MAX_PER_MSG = 50  # Companies per message to stay under Telegram's 4096 limit
+            chunks = [companies[j:j+MAX_PER_MSG] for j in range(0, len(companies), MAX_PER_MSG)]
             
-            for j, comp in enumerate(companies[:10], 1):
-                msg += f"  {j}. *{comp.get('company_name', 'N/A')}*\n"
-                msg += f"     Reg#: `{comp.get('registration_number', 'N/A')}`\n"
-                msg += f"     Role: {comp.get('position', 'N/A')}\n"
-            
-            if len(companies) > 10:
-                msg += f"     ... and {len(companies) - 10} more\n"
-            
-            kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_main")]]
-            await status_message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+            for chunk_idx, chunk in enumerate(chunks):
+                if chunk_idx == 0:
+                    msg = f"*👤 Director Result {i}/{len(results)}*\n\n"
+                    msg += f"*Name:* {person_name}\n"
+                    msg += f"*Companies ({len(companies)}):*\n"
+                else:
+                    msg = f"*{person_name} (continued {chunk_idx + 1}/{len(chunks)}):*\n"
+                
+                for j, comp in enumerate(chunk, 1 + chunk_idx * MAX_PER_MSG):
+                    msg += f"  {j}. *{comp.get('company_name', 'N/A')}*\n"
+                    msg += f"     Reg#: `{comp.get('registration_number', 'N/A')}`\n"
+                    msg += f"     Role: {comp.get('position', 'N/A')}\n"
+                
+                kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_main")]]
+                await status_message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb) if chunk_idx == len(chunks) - 1 else None)
     
     except Exception as e:
         logger.error(f"Director search error: {e}", exc_info=True)
